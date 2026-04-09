@@ -4,11 +4,10 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
-  ANTHROPIC_API_KEY,
-  ANTHROPIC_BASE_URL,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -60,6 +59,45 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+function getHomeDir(): string {
+  const home = process.env.HOME || os.homedir();
+  if (!home) {
+    throw new Error(
+      'Unable to determine home directory: HOME environment variable is not set and os.homedir() returned empty',
+    );
+  }
+  return home;
+}
+
+function ensureContainerWritable(targetPath: string): void {
+  if (!fs.existsSync(targetPath)) return;
+
+  const stack = [targetPath];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    try {
+      const stat = fs.statSync(current);
+      try {
+        fs.chownSync(current, 1000, 1000);
+      } catch {
+        // ignore
+      }
+      try {
+        fs.chmodSync(current, stat.isDirectory() ? 0o777 : 0o666);
+      } catch {
+        // ignore
+      }
+      if (stat.isDirectory()) {
+        for (const entry of fs.readdirSync(current)) {
+          stack.push(path.join(current, entry));
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
@@ -67,6 +105,7 @@ function buildVolumeMounts(
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
+  const homeDir = getHomeDir();
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
@@ -81,7 +120,6 @@ function buildVolumeMounts(
     });
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the OneCLI gateway, never exposed to containers.
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
       mounts.push({
@@ -136,45 +174,33 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
+  // Per-group Codex sessions directory (isolated from other groups)
+  // Each group gets their own .codex/ to prevent cross-group session access.
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
     group.folder,
-    '.claude',
+    '.codex',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
-  const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-            // Custom Anthropic API base URL (e.g. third-party proxy)
-            ...(ANTHROPIC_BASE_URL ? { ANTHROPIC_BASE_URL } : {}),
-            // Direct API key injection (used when ANTHROPIC_BASE_URL points to a third-party proxy
-            // that OneCLI cannot intercept, since OneCLI only matches api.anthropic.com)
-            ...(ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY } : {}),
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-  }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
+  // Seed group auth from host Codex login so subscription users can run
+  // without separate per-project API credentials.
+  const hostCodexDir = process.env.CODEX_HOME || path.join(homeDir, '.codex');
+  const hostAuthFile = path.join(hostCodexDir, 'auth.json');
+  const hostConfigFile = path.join(hostCodexDir, 'config.toml');
+  const groupAuthFile = path.join(groupSessionsDir, 'auth.json');
+  const groupConfigFile = path.join(groupSessionsDir, 'config.toml');
+
+  if (fs.existsSync(hostAuthFile)) {
+    fs.copyFileSync(hostAuthFile, groupAuthFile);
+  }
+  if (fs.existsSync(hostConfigFile)) {
+    fs.copyFileSync(hostConfigFile, groupConfigFile);
+  }
+  ensureContainerWritable(groupSessionsDir);
+
+  // Sync skills from container/skills/ into each group's .codex/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
@@ -182,12 +208,17 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const file of fs.readdirSync(srcDir)) {
+        const srcFile = path.join(srcDir, file);
+        const dstFile = path.join(dstDir, file);
+        fs.copyFileSync(srcFile, dstFile);
+      }
     }
   }
   mounts.push({
     hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
+    containerPath: '/home/node/.codex',
     readonly: false,
   });
 
@@ -197,15 +228,49 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'results'), { recursive: true });
+  ensureContainerWritable(groupIpcDir);
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
     readonly: false,
   });
 
+  // Only expose model auth/base URL variables needed by Codex, never the
+  // whole project .env.
+  const envDir = path.join(DATA_DIR, 'env');
+  fs.mkdirSync(envDir, { recursive: true });
+  const envFile = path.join(projectRoot, '.env');
+  if (fs.existsSync(envFile)) {
+    const envContent = fs.readFileSync(envFile, 'utf-8');
+    const allowedVars = [
+      'OPENAI_API_KEY',
+      'CODEX_API_KEY',
+      'OPENAI_BASE_URL',
+      'OPENAI_ORG_ID',
+      'OPENAI_PROJECT_ID',
+    ];
+    const filteredLines = envContent.split('\n').filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return false;
+      return allowedVars.some((name) => trimmed.startsWith(`${name}=`));
+    });
+
+    if (filteredLines.length > 0) {
+      fs.writeFileSync(
+        path.join(envDir, 'env'),
+        filteredLines.join('\n') + '\n',
+      );
+      mounts.push({
+        hostPath: envDir,
+        containerPath: '/workspace/env-dir',
+        readonly: true,
+      });
+    }
+  }
+
   // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
+  // can customize it without affecting other groups.
   const agentRunnerSrc = path.join(
     projectRoot,
     'container',
@@ -230,6 +295,8 @@ function buildVolumeMounts(
       fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
     }
   }
+  ensureContainerWritable(groupDir);
+  ensureContainerWritable(groupAgentRunnerDir);
   mounts.push({
     hostPath: groupAgentRunnerDir,
     containerPath: '/app/src',

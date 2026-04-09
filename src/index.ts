@@ -160,23 +160,25 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
-  // Copy CLAUDE.md template into the new group folder so agents have
-  // identity and instructions from the first run.  (Fixes #1391)
-  const groupMdFile = path.join(groupDir, 'CLAUDE.md');
-  if (!fs.existsSync(groupMdFile)) {
-    const templateFile = path.join(
-      GROUPS_DIR,
-      group.isMain ? 'main' : 'global',
-      'CLAUDE.md',
-    );
-    if (fs.existsSync(templateFile)) {
-      let content = fs.readFileSync(templateFile, 'utf-8');
-      if (ASSISTANT_NAME !== 'Andy') {
-        content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
-        content = content.replace(/You are Andy/g, `You are ${ASSISTANT_NAME}`);
+  // Seed both AGENTS.md and CLAUDE.md so Codex-native groups work immediately
+  // while existing Claude-oriented memory remains compatible.
+  const templateDir = path.join(GROUPS_DIR, group.isMain ? 'main' : 'global');
+  const templateFile = fs.existsSync(path.join(templateDir, 'AGENTS.md'))
+    ? path.join(templateDir, 'AGENTS.md')
+    : path.join(templateDir, 'CLAUDE.md');
+  if (fs.existsSync(templateFile)) {
+    let content = fs.readFileSync(templateFile, 'utf-8');
+    if (ASSISTANT_NAME !== 'Andy') {
+      content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
+      content = content.replace(/You are Andy/g, `You are ${ASSISTANT_NAME}`);
+    }
+
+    for (const memoryFile of ['AGENTS.md', 'CLAUDE.md']) {
+      const destination = path.join(groupDir, memoryFile);
+      if (!fs.existsSync(destination)) {
+        fs.writeFileSync(destination, content);
+        logger.info({ folder: group.folder, memoryFile }, 'Created group memory file from template');
       }
-      fs.writeFileSync(groupMdFile, content);
-      logger.info({ folder: group.folder }, 'Created CLAUDE.md from template');
     }
   }
 

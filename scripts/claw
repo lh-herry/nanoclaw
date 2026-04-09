@@ -24,6 +24,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 # ── Globals ─────────────────────────────────────────────────────────────────
@@ -59,11 +60,11 @@ ENV_FILE     = NANOCLAW_DIR / ".env"
 IMAGE        = "nanoclaw-agent:latest"
 
 SECRET_KEYS = [
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "OLLAMA_HOST",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT_ID",
 ]
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -143,6 +144,28 @@ def _read_allowlist_mounts() -> list[tuple[str, str, bool]]:
     return mounts
 
 
+def _ensure_container_writable(path: Path) -> None:
+    """Best-effort: make a host path writable by the container's node user."""
+    try:
+        uid = 1000
+        gid = 1000
+        for target in [path, *path.rglob("*")]:
+            try:
+                os.chown(target, uid, gid)
+            except Exception:
+                pass
+            try:
+                mode = target.stat().st_mode
+                if target.is_dir():
+                    os.chmod(target, mode | 0o777)
+                else:
+                    os.chmod(target, mode | 0o666)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def build_mounts(folder: str, is_main: bool) -> list[tuple[str, str, bool]]:
     """Return list of (host_path, container_path, readonly) tuples."""
     groups_dir  = NANOCLAW_DIR / "groups"
@@ -153,24 +176,60 @@ def build_mounts(folder: str, is_main: bool) -> list[tuple[str, str, bool]]:
     # Ensure required dirs exist
     group_dir = groups_dir / folder
     group_dir.mkdir(parents=True, exist_ok=True)
-    (sessions_dir / ".claude").mkdir(parents=True, exist_ok=True)
-    for sub in ("messages", "tasks", "input"):
+    codex_dir = sessions_dir / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    for sub in ("messages", "tasks", "input", "results"):
         (ipc_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    host_codex_dir = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    for name in ("auth.json", "config.toml"):
+        src = host_codex_dir / name
+        dst = codex_dir / name
+        if src.exists():
+            dst.write_bytes(src.read_bytes())
+    _ensure_container_writable(codex_dir)
 
     agent_runner_src = sessions_dir / "agent-runner-src"
     project_agent_runner = NANOCLAW_DIR / "container" / "agent-runner" / "src"
-    if not agent_runner_src.exists() and project_agent_runner.exists():
+    if project_agent_runner.exists():
         import shutil
-        shutil.copytree(project_agent_runner, agent_runner_src)
+        project_index = project_agent_runner / "index.ts"
+        cached_index = agent_runner_src / "index.ts"
+        needs_copy = (
+            not agent_runner_src.exists()
+            or not cached_index.exists()
+            or (
+                project_index.exists()
+                and project_index.stat().st_mtime > cached_index.stat().st_mtime
+            )
+        )
+        if needs_copy:
+            if agent_runner_src.exists():
+                shutil.rmtree(agent_runner_src)
+            shutil.copytree(project_agent_runner, agent_runner_src)
 
     mounts: list[tuple[str, str, bool]] = []
     if is_main:
         mounts.append((str(NANOCLAW_DIR), "/workspace/project", True))
     mounts.append((str(group_dir),           "/workspace/group",    False))
-    mounts.append((str(sessions_dir / ".claude"), "/home/node/.claude", False))
+    mounts.append((str(sessions_dir / ".codex"), "/home/node/.codex", False))
     mounts.append((str(ipc_dir),             "/workspace/ipc",      False))
     if agent_runner_src.exists():
         mounts.append((str(agent_runner_src), "/app/src",           False))
+
+    env_lines = []
+    for key, value in read_secrets(ENV_FILE).items():
+        env_lines.append(f"{key}={value}")
+    if env_lines:
+        env_dir = data_dir / "env"
+        env_dir.mkdir(parents=True, exist_ok=True)
+        (env_dir / "env").write_text("\n".join(env_lines) + "\n")
+        mounts.append((str(env_dir), "/workspace/env-dir", True))
+
+    _ensure_container_writable(group_dir)
+    _ensure_container_writable(ipc_dir)
+    _ensure_container_writable(agent_runner_src)
+
     # Allowlist-defined extra directories (e.g. /root/a4xs/GEM5)
     mounts.extend(_read_allowlist_mounts())
     return mounts
@@ -210,7 +269,17 @@ def run_container(runtime: str, image: str, payload: dict,
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
-    done = threading.Event()
+    parsed_outputs: list[dict] = []
+    close_requested = threading.Event()
+
+    def request_close() -> None:
+        if close_requested.is_set() or not folder:
+            return
+        close_requested.set()
+        close_path = NANOCLAW_DIR / "data" / "ipc" / folder / "input" / "_close"
+        close_path.parent.mkdir(parents=True, exist_ok=True)
+        close_path.write_text("")
+        dbg(f"requested runner shutdown via {close_path}")
 
     def stream_stderr():
         for raw in proc.stderr:
@@ -218,77 +287,99 @@ def run_container(runtime: str, image: str, payload: dict,
             if line.startswith("npm notice"):
                 continue
             stderr_lines.append(line)
+            if "Query ended, waiting for next IPC message..." in line:
+                request_close()
             print(line, file=sys.stderr)
 
     def stream_stdout():
+        parse_buffer = ""
         for raw in proc.stdout:
             line = raw.decode(errors="replace").rstrip()
             stdout_lines.append(line)
             dbg(f"stdout: {line}")
-            # Kill the container as soon as we see the closing sentinel —
-            # the Node.js event loop often keeps the process alive indefinitely.
-            if line.strip() == "---NANOCLAW_OUTPUT_END---":
-                dbg("output sentinel found, terminating container")
-                done.set()
+            parse_buffer += raw.decode(errors="replace")
+
+            while True:
+                start_marker = "---NANOCLAW_OUTPUT_START---\n"
+                end_marker = "\n---NANOCLAW_OUTPUT_END---"
+                start = parse_buffer.find(start_marker)
+                if start == -1:
+                    break
+                end = parse_buffer.find(end_marker, start + len(start_marker))
+                if end == -1:
+                    break
+
+                body = parse_buffer[start + len(start_marker):end]
+                parse_buffer = parse_buffer[end + len(end_marker):]
+
                 try:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        dbg("graceful stop timed out, force killing container")
-                        proc.kill()
-                except ProcessLookupError:
-                    pass
-                return
+                    data = json.loads(body.strip())
+                except json.JSONDecodeError:
+                    continue
+
+                parsed_outputs.append(data)
+                if (
+                    data.get("status") == "success"
+                    and data.get("result") is None
+                    and (data.get("newSessionId") or data.get("sessionId"))
+                ):
+                    request_close()
 
     t_err = threading.Thread(target=stream_stderr, daemon=True)
     t_out = threading.Thread(target=stream_stdout, daemon=True)
     t_err.start()
     t_out.start()
 
-    # Wait for sentinel or timeout
-    if not done.wait(timeout=timeout):
-        # Also check if process exited naturally
-        t_out.join(timeout=2)
-        if not done.is_set():
+    start = time.monotonic()
+    close_grace_deadline: float | None = None
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+
+        now = time.monotonic()
+        if close_requested.is_set() and close_grace_deadline is None:
+            close_grace_deadline = now + 5
+
+        if close_grace_deadline is not None and now >= close_grace_deadline:
+            dbg("graceful stop timed out after completion, force killing container")
             proc.kill()
-            sys.exit(f"error: container timed out after {timeout}s (no output sentinel received)")
+            proc.wait(timeout=5)
+            break
+
+        if now - start >= timeout:
+            proc.kill()
+            sys.exit(f"error: container timed out after {timeout}s")
+
+        time.sleep(0.1)
 
     t_err.join(timeout=5)
     t_out.join(timeout=5)
-    proc.wait()
     dbg(f"container done (rc={proc.returncode}), {len(stdout_lines)} stdout lines")
-    stdout = "\n".join(stdout_lines)
 
-    # Parse output block
-    match = re.search(
-        r"---NANOCLAW_OUTPUT_START---\n(.*?)\n---NANOCLAW_OUTPUT_END---",
-        stdout,
-        re.DOTALL,
-    )
-    success = False
-
-    if match:
-        try:
-            data = json.loads(match.group(1))
+    if parsed_outputs:
+        final_success: dict | None = None
+        final_error: dict | None = None
+        for data in parsed_outputs:
             status = data.get("status", "unknown")
-            if status == "success":
-                print(data.get("result", ""))
-                session_id = data.get("newSessionId") or data.get("sessionId")
-                if session_id:
-                    print(f"\n[session: {session_id}]", file=sys.stderr)
-                success = True
-            else:
-                print(f"[{status}] {data.get('result', '')}", file=sys.stderr)
-                sys.exit(1)
-        except json.JSONDecodeError:
-            print(match.group(1))
-    else:
-        # No structured output — print raw stdout
-        print(stdout)
+            if status == "success" and data.get("result") is not None:
+                final_success = data
+            elif status == "error":
+                final_error = data
 
-    if success:
-        return
+        if final_error is not None:
+            print(f"[error] {final_error.get('error') or final_error.get('result', '')}", file=sys.stderr)
+            sys.exit(1)
+
+        if final_success is not None:
+            print(final_success.get("result", ""))
+            session_id = final_success.get("newSessionId") or final_success.get("sessionId")
+            if session_id:
+                print(f"\n[session: {session_id}]", file=sys.stderr)
+            return
+
+    stdout = "\n".join(stdout_lines)
+    print(stdout)
 
     if proc.returncode not in (0, None):
         sys.exit(proc.returncode)
@@ -382,8 +473,8 @@ def main():
         "isMain": is_main,
         "secrets": secrets,
     }
-    if group_name:
-        payload["groupFolder"] = group_name
+    if group_folder:
+        payload["groupFolder"] = group_folder
     if args.session:
         payload["sessionId"] = args.session
         payload["resumeAt"] = "latest"

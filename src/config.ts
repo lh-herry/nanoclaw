@@ -9,6 +9,11 @@ const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'ONECLI_URL',
+  'OPENAI_API_KEY',
+  'CODEX_API_KEY',
+  'OPENAI_BASE_URL',
+  'OPENAI_ORG_ID',
+  'OPENAI_PROJECT_ID',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_API_KEY',
   'TZ',
@@ -54,6 +59,16 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   10,
 ); // 10MB default
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
+export const OPENAI_API_KEY =
+  process.env.OPENAI_API_KEY || envConfig.OPENAI_API_KEY;
+export const CODEX_API_KEY =
+  process.env.CODEX_API_KEY || envConfig.CODEX_API_KEY;
+export const OPENAI_BASE_URL =
+  process.env.OPENAI_BASE_URL || envConfig.OPENAI_BASE_URL;
+export const OPENAI_ORG_ID =
+  process.env.OPENAI_ORG_ID || envConfig.OPENAI_ORG_ID;
+export const OPENAI_PROJECT_ID =
+  process.env.OPENAI_PROJECT_ID || envConfig.OPENAI_PROJECT_ID;
 export const ANTHROPIC_BASE_URL =
   process.env.ANTHROPIC_BASE_URL || envConfig.ANTHROPIC_BASE_URL;
 export const ANTHROPIC_API_KEY =
