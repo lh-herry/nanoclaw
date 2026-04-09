@@ -33,6 +33,7 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  secrets?: Record<string, string>;
 }
 
 interface ContainerOutput {
@@ -621,8 +622,15 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
-  // No real secrets exist in the container environment.
+  // Credentials: normally injected by OneCLI. When using a third-party proxy
+  // (ANTHROPIC_BASE_URL pointing to a non-Anthropic host), secrets are passed
+  // directly in the payload. Set them on process.env so Claude Code internals
+  // (which read process.env directly) can authenticate.
+  if (containerInput.secrets) {
+    for (const [key, value] of Object.entries(containerInput.secrets)) {
+      process.env[key] = value;
+    }
+  }
   const sdkEnv: Record<string, string | undefined> = {
     ...process.env,
     CLAUDE_CODE_AUTO_COMPACT_WINDOW: '165000',
